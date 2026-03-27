@@ -1,0 +1,102 @@
+# =========================
+# Secrets / environment
+# =========================
+.env
+.env.*
+!.env.example
+alembic.ini
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+.venv312/
+venv/
+env/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Test / coverage / cache
+# =========================
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# =========================
+# Build / packaging
+# =========================
+build/
+dist/
+*.egg-info/
+
+# =========================
+# Local databases / dumps
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.sqlitedb
+dump.sql
+backup.sql
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Sensitive / local docs
+# =========================
+Pseudocodigo asistente.txt
+diagrama de flujo de carpetas.txt
+
+
+
+app/rag/providers.py
+app/api/routes_audit.py
+app/api/routes_case.py
+app/ingestion/normas
+app/ingestion/pdf
+app/ingestion/connectors
+app/ingestion/text_parse_ley_amparo.py
+app/ingestion/text_parse_lfpca.py
+app/ingestion/etl_service.py
+app/ingestion/ingest_cpeum.py
+app/ingestion/ingest_folder.py
+app/ingestion/ingest_ley_amparo.py
+app/ingestion/ingest_lfpca.py
+app/ingestion/text_parse_cpeum.py
+app/storage
+app/__pycache__
+app/db
+app/_init_.py
+app/api/_init_.py
+app/core/_init_.py
+app/services/_init_.py
+app/tests/__pycache__
+
+
