@@ -5,7 +5,7 @@ from pathlib import Path
 from normative_parser import parse_cff_articles
 
 
-CFF_PATH = Path("C:/asistente_juridico/app/ingestion/normas/cff.txt")
+CFF_PATH = Path("C:/YOUR_PATH.txt")
 
 
 def main() -> None:
@@ -14,7 +14,7 @@ def main() -> None:
 
     print(f"Total artículos detectados: {len(articles)}")
 
-    targets = ["1o", "4o-A", "17-A", "17-H Bis", "20-Bis", "69-B", "69-B Bis"]
+    targets = ["1o", "4o-A", "17-A"]
     detected = {a.articulo: a for a in articles}
 
     for key in targets:
