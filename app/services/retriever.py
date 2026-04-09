@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 import psycopg
+import logging
 import re
 from openai import OpenAI
 from app.core.config import settings
@@ -10,6 +11,7 @@ client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 STOPWORDS = {"el","la","los","las","un","una","y","o","de","del","al","en","por","para","con","sin"}
 
+logger = logging.getLogger(__name__)
 
 @dataclass
 class RetrievedChunk:
@@ -92,14 +94,19 @@ def _parse_norm_reference(query: str) -> dict[str, Optional[str]]:
     if inc_match:
         inciso = inc_match.group(1).lower()
 
-    if re.search(r"(?i)\bCFF\b|C[oó]digo Fiscal de la Federaci[oó]n", q):
+    if re.search(r"(?i)\bCFF\b|c[oó]digo fiscal de la federaci[oó]n|codigo fiscal de la federacion", q):
         abreviatura = "CFF"
+    elif re.search(r"(?i)\bCPEUM\b|constituci[oó]n pol[ií]tica de los estados unidos mexicanos", q):
+        abreviatura = "CPEUM"
+    elif re.search(r"(?i)\bconstituci[oó]n\b|\bconstitucional\b", q):
+        abreviatura = "CPEUM"
     elif re.search(r"(?i)\bLey de Amparo\b", q):
         abreviatura = "LA"
-    elif re.search(r"(?i)\bLFPCA\b|Ley Federal de Procedimiento Contencioso Administrativo", q):
+    elif re.search(
+        r"(?i)\bLFPCA\b|ley federal de procedimiento contencioso administrativo",
+        q,
+    ):
         abreviatura = "LFPCA"
-    elif re.search(r"(?i)\bCPEUM\b|Constituci[oó]n Pol[ií]tica de los Estados Unidos Mexicanos", q):
-        abreviatura = "CPEUM"
 
     return {
         "articulo": articulo,
@@ -145,6 +152,9 @@ def _resolve_document_ids(conn: psycopg.Connection, expediente: str | None, limi
 
 
 def _is_structured_exact_query(norm_ref: dict[str, Optional[str]]) -> bool:
+    if norm_ref["articulo"] and norm_ref["abreviatura"]:
+        return True
+
     return bool(norm_ref["articulo"]) and bool(
         norm_ref["apartado"] or norm_ref["fraccion"] or norm_ref["inciso"]
     )
@@ -198,9 +208,14 @@ def _extract_inciso_from_meta(meta: dict) -> str | None:
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MODIFICACIÓN PRINCIPAL: query_embedding se recibe como parámetro.
+# Ya NO se llama a client.embeddings aquí dentro.
+# ─────────────────────────────────────────────────────────────────────────────
 def _run_search_query(
     *,
     query: str,
+    query_embedding: list[float],   # ← recibe el vector pre-calculado
     top_k: int,
     w_vec: float,
     w_fts: float,
@@ -221,152 +236,148 @@ def _run_search_query(
     fts_strict = " ".join(safe_words[:8]) if safe_words else query
     fts_loose = " | ".join(safe_words) if safe_words else ""
 
-    q_emb = client.embeddings.create(
-        model=settings.EMBEDDINGS_MODEL,
-        input=query
-    ).data[0].embedding
-    emb_str = _embedding_to_pgvector_str(q_emb)
+    # Usar el embedding recibido — sin llamar a la API de OpenAI
+    emb_str = _embedding_to_pgvector_str(query_embedding)
 
     db_url = _db_url_psycopg()
     TSV_COL = "chunk_tsv"
 
-    document_ids: list[int] | None = None
-    with psycopg.connect(db_url) as tmp_conn:
-        document_ids = _resolve_document_ids(tmp_conn, expediente)
-
-    sql = f"""
-    WITH
-    q AS (
-        SELECT
-            (%s)::vector AS qvec,
-            websearch_to_tsquery('spanish', %s) AS tsq_strict,
-            to_tsquery('spanish', NULLIF(%s, '')) AS tsq_loose,
-            (%s)::text AS expediente,
-            %s::int[] AS doc_ids,
-            %s::text AS articulo_ref,
-            %s::text AS fraccion_ref,
-            %s::text AS apartado_ref,
-            %s::text AS inciso_ref,
-            %s::text AS abreviatura_ref
-    ),
-    base AS (
-        SELECT
-            c.chunk_id,
-            c.document_id,
-            c.chunk_text,
-            c.chunk_meta,
-            d.identifiers,
-            d.canonical_url,
-            d.authority,
-            d.doc_type,
-            d.publication_date,
-            (v.embedding <=> q.qvec) AS vec_dist,
-            COALESCE(ts_rank_cd(c.{TSV_COL}, q.tsq_loose), 0) +
-            (COALESCE(ts_rank_cd(c.{TSV_COL}, q.tsq_strict), 0) * 2.5) AS fts_rank,
-            CASE
-                WHEN c.chunk_text ~* '^(\\s*AMPARO\\s+EN\\s+REVISI[ÓO]N|\\s*PONENTE:|\\s*SECRETARIO:|\\s*RECURRENTE|\\s*QUEJOSA)'
-                    THEN 0.85
-                ELSE 1.00
-            END AS header_penalty,
-            (
-                CASE
-                    WHEN q.abreviatura_ref IS NOT NULL
-                         AND d.identifiers->>'abreviatura' = q.abreviatura_ref
-                    THEN 0.22 ELSE 0.0
-                END
-                +
-                CASE
-                    WHEN q.articulo_ref IS NOT NULL
-                         AND d.identifiers->>'articulo' = q.articulo_ref
-                    THEN 0.55 ELSE 0.0
-                END
-                +
-                CASE
-                    WHEN q.fraccion_ref IS NOT NULL
-                         AND c.chunk_meta->>'fraccion' = q.fraccion_ref
-                    THEN 0.32 ELSE 0.0
-                END
-                +
-                CASE
-                    WHEN q.inciso_ref IS NOT NULL
-                         AND c.chunk_meta->>'inciso' = q.inciso_ref
-                    THEN 0.18 ELSE 0.0
-                END
-                +
-                CASE
-                    WHEN q.apartado_ref IS NOT NULL
-                         AND (c.chunk_meta->>'path') LIKE ('%%/ap:' || q.apartado_ref || '%%')
-                    THEN 0.28 ELSE 0.0
-                END
-            ) AS metadata_bonus
-        FROM chunk_vectors v
-        JOIN chunks c ON c.chunk_id = v.chunk_id
-        JOIN documents d ON c.document_id = d.id
-        CROSS JOIN q
-        WHERE
-            (
-                (q.doc_ids IS NOT NULL AND c.document_id = ANY(q.doc_ids))
-                OR
-                (q.doc_ids IS NULL AND (q.expediente IS NULL OR c.chunk_text ILIKE ('%%' || q.expediente || '%%')))
-            )
-            AND (q.abreviatura_ref IS NULL OR d.identifiers->>'abreviatura' = q.abreviatura_ref)
-            AND (q.articulo_ref IS NULL OR d.identifiers->>'articulo' = q.articulo_ref)
-            AND (q.fraccion_ref IS NULL OR c.chunk_meta->>'fraccion' = q.fraccion_ref)
-            AND (q.inciso_ref IS NULL OR c.chunk_meta->>'inciso' = q.inciso_ref)
-            AND (
-                q.apartado_ref IS NULL
-                OR (c.chunk_meta->>'path') LIKE ('%%/ap:' || q.apartado_ref || '%%')
-            )
-    ),
-    stats AS (
-        SELECT GREATEST(MAX(fts_rank), 1e-9) AS max_fts FROM base
-    ),
-    scored AS (
-        SELECT
-            b.*,
-            GREATEST(0.0, LEAST(1.0, 1.0 - (b.vec_dist / 2.0))) AS vec_sim,
-            (b.fts_rank / s.max_fts) AS fts_norm
-        FROM base b
-        CROSS JOIN stats s
-    )
-    SELECT
-        s.chunk_id,
-        s.chunk_text,
-        s.vec_sim,
-        s.fts_rank,
-        s.fts_norm,
-        s.header_penalty,
-        ((%s * s.vec_sim) + (%s * s.fts_norm) + s.metadata_bonus) * s.header_penalty AS score,
-        s.document_id,
-        s.identifiers,
-        s.chunk_meta,
-        s.canonical_url,
-        s.authority,
-        s.doc_type,
-        s.publication_date
-    FROM scored s
-    ORDER BY score DESC
-    LIMIT %s;
-    """
-
-    params = (
-        emb_str,
-        fts_strict,
-        fts_loose,
-        expediente,
-        document_ids,
-        article_ref,
-        fraccion_ref,
-        apartado_ref,
-        inciso_ref,
-        abreviatura_ref,
-        w_vec,
-        w_fts,
-        top_k,
-    )
-
-    out: List[RetrievedChunk] = []
+    # Reutilizar una sola conexión para resolver expediente y ejecutar la query
     with psycopg.connect(db_url) as conn:
+        document_ids = _resolve_document_ids(conn, expediente)
+
+        sql = f"""
+        WITH
+        q AS (
+            SELECT
+                (%s)::vector AS qvec,
+                websearch_to_tsquery('spanish', %s) AS tsq_strict,
+                to_tsquery('spanish', NULLIF(%s, '')) AS tsq_loose,
+                (%s)::text AS expediente,
+                %s::int[] AS doc_ids,
+                %s::text AS articulo_ref,
+                %s::text AS fraccion_ref,
+                %s::text AS apartado_ref,
+                %s::text AS inciso_ref,
+                %s::text AS abreviatura_ref
+        ),
+        base AS (
+            SELECT
+                c.chunk_id,
+                c.document_id,
+                c.chunk_text,
+                c.chunk_meta,
+                d.identifiers,
+                d.canonical_url,
+                d.authority,
+                d.doc_type,
+                d.publication_date,
+                (v.embedding <=> q.qvec) AS vec_dist,
+                COALESCE(ts_rank_cd(c.{TSV_COL}, q.tsq_loose), 0) +
+                (COALESCE(ts_rank_cd(c.{TSV_COL}, q.tsq_strict), 0) * 2.5) AS fts_rank,
+                CASE
+                    WHEN c.chunk_text ~* '^(\\s*AMPARO\\s+EN\\s+REVISI[ÓO]N|\\s*PONENTE:|\\s*SECRETARIO:|\\s*RECURRENTE|\\s*QUEJOSA)'
+                        THEN 0.85
+                    ELSE 1.00
+                END AS header_penalty,
+                (
+                    CASE
+                        WHEN q.abreviatura_ref IS NOT NULL
+                             AND d.identifiers->>'abreviatura' = q.abreviatura_ref
+                        THEN 0.45 ELSE 0.0
+                    END
+                    +
+                    CASE
+                        WHEN q.articulo_ref IS NOT NULL
+                             AND d.identifiers->>'articulo' = q.articulo_ref
+                        THEN 0.55 ELSE 0.0
+                    END
+                    +
+                    CASE
+                        WHEN q.fraccion_ref IS NOT NULL
+                             AND c.chunk_meta->>'fraccion' = q.fraccion_ref
+                        THEN 0.32 ELSE 0.0
+                    END
+                    +
+                    CASE
+                        WHEN q.inciso_ref IS NOT NULL
+                             AND c.chunk_meta->>'inciso' = q.inciso_ref
+                        THEN 0.18 ELSE 0.0
+                    END
+                    +
+                    CASE
+                        WHEN q.apartado_ref IS NOT NULL
+                             AND (c.chunk_meta->>'path') LIKE ('%%/ap:' || q.apartado_ref || '%%')
+                        THEN 0.28 ELSE 0.0
+                    END
+                ) AS metadata_bonus
+            FROM chunk_vectors v
+            JOIN chunks c ON c.chunk_id = v.chunk_id
+            JOIN documents d ON c.document_id = d.id
+            CROSS JOIN q
+            WHERE
+                (
+                    (q.doc_ids IS NOT NULL AND c.document_id = ANY(q.doc_ids))
+                    OR
+                    (q.doc_ids IS NULL AND (q.expediente IS NULL OR c.chunk_text ILIKE ('%%' || q.expediente || '%%')))
+                )
+                AND (q.abreviatura_ref IS NULL OR d.identifiers->>'abreviatura' = q.abreviatura_ref)
+                AND (q.articulo_ref IS NULL OR d.identifiers->>'articulo' = q.articulo_ref)
+                AND (q.fraccion_ref IS NULL OR c.chunk_meta->>'fraccion' = q.fraccion_ref)
+                AND (q.inciso_ref IS NULL OR c.chunk_meta->>'inciso' = q.inciso_ref)
+                AND (
+                    q.apartado_ref IS NULL
+                    OR (c.chunk_meta->>'path') LIKE ('%%/ap:' || q.apartado_ref || '%%')
+                )
+        ),
+        stats AS (
+            SELECT GREATEST(MAX(fts_rank), 1e-9) AS max_fts FROM base
+        ),
+        scored AS (
+            SELECT
+                b.*,
+                GREATEST(0.0, LEAST(1.0, 1.0 - (b.vec_dist / 2.0))) AS vec_sim,
+                (b.fts_rank / s.max_fts) AS fts_norm
+            FROM base b
+            CROSS JOIN stats s
+        )
+        SELECT
+            s.chunk_id,
+            s.chunk_text,
+            s.vec_sim,
+            s.fts_rank,
+            s.fts_norm,
+            s.header_penalty,
+            ((%s * s.vec_sim) + (%s * s.fts_norm) + s.metadata_bonus) * s.header_penalty AS score,
+            s.document_id,
+            s.identifiers,
+            s.chunk_meta,
+            s.canonical_url,
+            s.authority,
+            s.doc_type,
+            s.publication_date
+        FROM scored s
+        ORDER BY score DESC
+        LIMIT %s;
+        """
+
+        params = (
+            emb_str,
+            fts_strict,
+            fts_loose,
+            expediente,
+            document_ids,
+            article_ref,
+            fraccion_ref,
+            apartado_ref,
+            inciso_ref,
+            abreviatura_ref,
+            w_vec,
+            w_fts,
+            top_k,
+        )
+
+        out: List[RetrievedChunk] = []
         with conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -541,9 +552,13 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
     if top_k < 1:
         top_k = 1
 
-    norm_ref = _parse_norm_reference(query)
-    print("DEBUG norm_ref:", norm_ref)
+    query_embedding = client.embeddings.create(
+        model=settings.EMBEDDINGS_MODEL,
+        input=query
+    ).data[0].embedding
 
+    norm_ref = _parse_norm_reference(query)
+    
     articulo_ref = norm_ref["articulo"]
     fraccion_ref = norm_ref["fraccion"]
     apartado_ref = norm_ref["apartado"]
@@ -552,8 +567,9 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
 
     is_exact = _is_structured_exact_query(norm_ref)
 
-    print(
-        "DEBUG strict search:",
+    logger.debug("norm_ref=%s", norm_ref)
+    logger.debug(
+        "strict_search=%s",
         {
             "articulo_ref": articulo_ref,
             "apartado_ref": apartado_ref,
@@ -561,11 +577,12 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
             "inciso_ref": inciso_ref,
             "abreviatura_ref": abreviatura_ref,
             "is_exact": is_exact,
-        }
+        },
     )
 
     strict_results = _run_search_query(
         query=query,
+        query_embedding=query_embedding,
         top_k=top_k,
         w_vec=w_vec,
         w_fts=w_fts,
@@ -584,10 +601,10 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
     )
 
     if not is_exact:
-        return strict_results
+        return strict_results[:top_k]
 
     exact_count = _count_exact_structural_matches(strict_results, norm_ref)
-    if exact_count >= 2:
+    if exact_count >= 1:
         return _keep_exact_subtree_if_available(strict_results, norm_ref, top_k)
 
     fallback_results: List[RetrievedChunk] = list(strict_results)
@@ -596,6 +613,7 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
         fallback_results.extend(
             _run_search_query(
                 query=query,
+                query_embedding=query_embedding,   # ← mismo vector
                 top_k=top_k,
                 w_vec=w_vec,
                 w_fts=w_fts,
@@ -615,6 +633,7 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
         fallback_results.extend(
             _run_search_query(
                 query=query,
+                query_embedding=query_embedding,   # ← mismo vector
                 top_k=top_k,
                 w_vec=w_vec,
                 w_fts=w_fts,
@@ -634,6 +653,7 @@ def search_hybrid(query: str, top_k: int = 8, w_vec: float = 0.55, w_fts: float 
         fallback_results.extend(
             _run_search_query(
                 query=query,
+                query_embedding=query_embedding,   # ← mismo vector
                 top_k=top_k,
                 w_vec=w_vec,
                 w_fts=w_fts,

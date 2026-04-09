@@ -197,6 +197,7 @@ def _parse_structured_ref(question: str) -> dict[str, str | None]:
     fraccion = None
     apartado = None
     inciso = None
+    abreviatura = None
 
     art_match = re.search(
         r"""(?ix)
@@ -233,11 +234,23 @@ def _parse_structured_ref(question: str) -> dict[str, str | None]:
     if inc_match:
         inciso = inc_match.group(1).lower()
 
+    if re.search(r"(?i)\bCFF\b|c[oó]digo fiscal de la federaci[oó]n|codigo fiscal de la federacion", q):
+        abreviatura = "CFF"
+    elif re.search(r"(?i)\bCPEUM\b|constituci[oó]n pol[ií]tica de los estados unidos mexicanos", q):
+        abreviatura = "CPEUM"
+    elif re.search(r"(?i)\bconstituci[oó]n\b|\bconstitucional\b", q):
+        abreviatura = "CPEUM"
+    elif re.search(r"(?i)\bLey de Amparo\b", q):
+        abreviatura = "LA"
+    elif re.search(r"(?i)\bLFPCA\b|ley federal de procedimiento contencioso administrativo", q):
+        abreviatura = "LFPCA"
+
     return {
         "articulo": articulo,
         "fraccion": fraccion,
         "apartado": apartado,
         "inciso": inciso,
+        "abreviatura": abreviatura,
     }
 
 
@@ -317,12 +330,36 @@ def legal_rerank(question: str, chunks: List[RetrievedChunk], top_k: int | None 
         meta_fraccion = _extract_fraccion_from_meta(chunk_meta)
         meta_apartado = _extract_apartado_from_meta(chunk_meta)
         meta_inciso = _extract_inciso_from_meta(chunk_meta)
+        meta_abreviatura = (
+            identifiers.get("abreviatura")
+            or chunk_meta.get("abreviatura")
+            or ""
+        )
+        meta_abreviatura = str(meta_abreviatura).upper()
 
         bonus = 0.0
 
         if expediente:
             if identifiers.get("expediente") == expediente or expediente in text:
                 bonus += 0.35
+        
+        if structured_ref["abreviatura"]:
+            if meta_abreviatura == structured_ref["abreviatura"]:
+                bonus += 0.85
+            elif meta_abreviatura:
+                bonus -= 0.65
+
+        if any(x in q_lower for x in ["constitución", "constitucion", "constitucional", "cpeum"]):
+            if meta_abreviatura == "CPEUM":
+                bonus += 0.30
+            elif meta_abreviatura == "CFF":
+                bonus -= 0.30
+
+        if any(x in q_lower for x in ["código fiscal", "codigo fiscal", "cff"]):
+            if meta_abreviatura == "CFF":
+                bonus += 0.30
+            elif meta_abreviatura == "CPEUM":
+                bonus -= 0.30
 
         if structured_ref["articulo"]:
             if meta_articulo == structured_ref["articulo"]:

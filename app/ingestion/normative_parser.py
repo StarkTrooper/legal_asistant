@@ -11,11 +11,11 @@ from typing import Callable, List, Optional, Sequence
 
 @dataclass
 class NormUnit:
-    unit_type: str                  # article | paragraph | apartado | fraccion | inciso
-    unit_id: str                    # p1 | pre | A | I | a
-    label: str                      # Párrafo 1 | Apartado A | Fracción I | Inciso a)
+    unit_type: str                  
+    unit_id: str                    
+    label: str                      
     text: str
-    path: str                       # art:69-B/ap:A/fr:I/inc:a
+    path: str                       
     parent_path: Optional[str]
     order_index: int
     source_order: int
@@ -53,29 +53,32 @@ class NormArticle:
 ARTICLE_HEADER_RE = re.compile(
     r"""(?imx)
     ^
+    \s*
     (?P<header>
-        art[ií]culo
+        ART[IÍ]CULO
         \s+
         (?P<article>
-            \d+(?:o\.)?
+            \d+
             (?:
-                \s*-\s*[A-Z]
-                |
-                -[A-Z]
-                |
-                \s+[A-Z]
+                o
+                |o\.
+                |º
+                |º\.
             )?
             (?:
-                \s*-\s*
+                \s*-\s*(?:[A-Z]|\d+)
                 |
-                \s+
-                |
-                -
+                -(?:[A-Z]|\d+)
             )?
-            (?P<suffix>Bis|Ter|Qu[aá]ter|Quater)?
+            (?:
+                \s+|-
+            )?
+            (?:Bis|Ter|Qu[aá]ter|Quater)?
         )
     )
-    (?P<ending>\.-|\.)\s*
+    \s*
+    (?P<ending>\.-|\.|-)?
+    \s*
     """
 )
 
@@ -188,6 +191,7 @@ def _clean_block(text: str) -> str:
 def _normalize_article_key(article_num: str) -> str:
     value = article_num.strip()
     value = value.replace("–", "-").replace("—", "-")
+    value = value.replace("º", "o")
     value = re.sub(r"\s*-\s*", "-", value)
     value = re.sub(r"\s+", " ", value)
     value = re.sub(r"\.$", "", value)
@@ -197,6 +201,9 @@ def _normalize_article_key(article_num: str) -> str:
     value = re.sub(r"\bQUÁTER\b", "Quáter", value, flags=re.IGNORECASE)
     value = re.sub(r"\bQUATER\b", "Quater", value, flags=re.IGNORECASE)
     value = re.sub(r"-(Bis|Ter|Quáter|Quater)\b", r"-\1", value, flags=re.IGNORECASE)
+
+    value = re.sub(r"(\d+)o\b", r"\1o", value)
+    value = re.sub(r"-$", "", value)
 
     return value.strip()
 
@@ -279,12 +286,46 @@ def _find_first_cut_position(text: str, patterns: Sequence[re.Pattern[str]]) -> 
 # Preprocesadores por ordenamiento
 # ============================================================
 
+def _preprocess_la_text(raw_text: str) -> str:
+    text = normalize_norm_text(raw_text)
+    text = _remove_editorial_lines(text)
+    return text.strip()
+
+
+def _preprocess_lfpca_text(raw_text: str) -> str:
+    text = normalize_norm_text(raw_text)
+    text = _remove_editorial_lines(text)
+    return text.strip()
+
+
+def _preprocess_cff_text(raw_text: str) -> str:
+    text = normalize_norm_text(raw_text)
+
+    art_263_match = re.search(
+        r"(?im)^\s*art[ií]culo\s+263(?:\.-|\.|\s)",
+        text,
+    )
+    if not art_263_match:
+        return text
+
+    tail = text[art_263_match.start():]
+    cut_at_tail = _find_first_cut_position(
+        tail,
+        patterns=(TRANSITORIOS_START_RE, REFORMA_TRANSITORIOS_RE),
+    )
+    if cut_at_tail is None:
+        return text
+
+    cut_at = art_263_match.start() + cut_at_tail
+    return text[:cut_at].strip()
+
 CPEUM_TAIL_CUT_PATTERNS = [
     re.compile(r"(?im)^\s*Art[ií]culos?\s+Transitorios\s*$"),
-    re.compile(r"(?im)^\s*Art[íi]culos?\s+Transitorios\s+de\s+los?\s+Decretos?\s+de\s+Reforma\s*$"),
+    re.compile(r"(?im)^\s*Art[ií]culos?\s+Transitorios\s+de\s+los?\s+Decretos?\s+de\s+Reforma\s*$"),
     re.compile(r"(?im)^\s*DECRETO\s+por\s+el\s+que\s+se\s+reforman"),
     re.compile(r"(?im)^\s*DECRETO\s+por\s+el\s+que\s+se\s+adicionan"),
     re.compile(r"(?im)^\s*DECRETO\s+por\s+el\s+que\s+se\s+derogan"),
+    re.compile(r"(?im)^\s*Artículo\s+Único\.-"),
 ]
 
 def _preprocess_cpeum_text(raw_text: str) -> str:
@@ -310,12 +351,6 @@ def _preprocess_cpeum_text(raw_text: str) -> str:
         cut_at = art_136_match.start() + min(cut_positions)
         text = text[:cut_at]
 
-    return text.strip()
-
-
-def _preprocess_cpeum_text(raw_text: str) -> str:
-    text = normalize_norm_text(raw_text)
-    text = _remove_editorial_lines(text)
     return text.strip()
 
 
@@ -862,33 +897,32 @@ def parse_cpeum_articles(
     )
 
 
+def parse_la_articles(
+    raw_text: str,
+    ordenamiento: str = "Ley de Amparo",
+    abreviatura: str = "LA",
+) -> List[ParsedArticle]:
+    return _parse_articles_generic(
+        raw_text=raw_text,
+        ordenamiento=ordenamiento,
+        abreviatura=abreviatura,
+        preprocess_fn=_preprocess_la_text,
+        build_units_fn=_build_generic_article_units,
+    )
+
+
 def parse_lfpca_articles(
     raw_text: str,
     ordenamiento: str = "Ley Federal de Procedimiento Contencioso Administrativo",
     abreviatura: str = "LFPCA",
 ) -> List[ParsedArticle]:
     return _parse_articles_generic(
-        raw_text,
+        raw_text=raw_text,
         ordenamiento=ordenamiento,
         abreviatura=abreviatura,
-        preprocess_fn=normalize_norm_text,
+        preprocess_fn=_preprocess_lfpca_text,
         build_units_fn=_build_generic_article_units,
     )
-
-
-def parse_ley_amparo_articles(
-    raw_text: str,
-    ordenamiento: str = "Ley de Amparo",
-    abreviatura: str = "LA",
-) -> List[ParsedArticle]:
-    return _parse_articles_generic(
-        raw_text,
-        ordenamiento=ordenamiento,
-        abreviatura=abreviatura,
-        preprocess_fn=normalize_norm_text,
-        build_units_fn=_build_generic_article_units,
-    )
-
 
 # ============================================================
 # Compatibilidad temporal
@@ -903,7 +937,7 @@ def split_articles(
         "CFF": parse_cff_articles,
         "CPEUM": parse_cpeum_articles,
         "LFPCA": parse_lfpca_articles,
-        "LA": parse_ley_amparo_articles,
+        "LA": parse_la_articles,
     }
 
     parser = parser_map.get(abreviatura.upper(), None)
@@ -924,11 +958,11 @@ def split_articles(
 
     return [
         NormArticle(
-            ordenamiento=a.ordenamiento,
-            abreviatura=a.abreviatura,
-            articulo=a.articulo,
-            titulo=a.titulo,
-            contenido=a.full_text,
+            ordenamiento = a.ordenamiento,
+            abreviatura = a.abreviatura,
+            articulo = a.articulo,
+            titulo = a.titulo,
+            contenido = a.full_text,
         )
         for a in parsed
     ]

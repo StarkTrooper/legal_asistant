@@ -5,6 +5,7 @@
 .env.*
 !.env.example
 alembic.ini
+.gitignore
 
 # =========================
 # Python
@@ -74,7 +75,8 @@ logs/
 Pseudocodigo asistente.txt
 diagrama de flujo de carpetas.txt
 
-
+app/output
+app/tmp
 
 app/rag/providers.py
 app/api/routes_audit.py

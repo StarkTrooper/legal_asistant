@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, List, Set
+from typing import Dict, Any, List, Set, Optional
 import re
 import logging
 
@@ -31,11 +31,11 @@ Reglas:
 
 Formato de respuesta:
 - No muestres chunk_id, path, metadata interna ni trazas de depuración.
-- No enumeres la “ubicación estructural de los fragmentos aportados”.
+- No enumeres la "ubicación estructural de los fragmentos aportados".
 - Redacta como respuesta jurídica limpia para usuario final.
 - Si la pregunta pide el contenido de una norma, inicia indicando directamente qué prevé la disposición consultada.
 - Si hay incisos, preséntalos como incisos a), b), c), etc., sin repetir innecesariamente el preámbulo dos veces.
-- Cierra, cuando corresponda, con una referencia breve del tipo: “Referencia: CFF, artículo 27, apartado D, fracción II.”
+- Cierra, cuando corresponda, con una referencia breve del tipo: "Referencia: CFF, artículo 27, apartado D, fracción II."
 """
 
 STOPWORDS_CHECK = {
@@ -333,8 +333,12 @@ def _parse_structured_ref(question: str) -> dict[str, str | None]:
     apartado = None
     fraccion = None
     inciso = None
+    abreviatura = None
 
-    art_match = re.search(r"(?i)art[ií]culo\s+([0-9]+(?:-[A-Z])?(?:\s+(?:Bis|Ter|Qu[aá]ter|Quater))?)", question)
+    art_match = re.search(
+        r"(?i)art[ií]culo\s+([0-9]+(?:-[A-Z])?(?:\s+(?:Bis|Ter|Qu[aá]ter|Quater))?)",
+        question
+    )
     if art_match:
         articulo = re.sub(r"\s+", " ", art_match.group(1)).strip()
 
@@ -350,11 +354,23 @@ def _parse_structured_ref(question: str) -> dict[str, str | None]:
     if inc_match:
         inciso = inc_match.group(1).lower()
 
+    if re.search(r"(?i)\bCFF\b|c[oó]digo fiscal de la federaci[oó]n|codigo fiscal de la federacion", question):
+        abreviatura = "CFF"
+    elif re.search(r"(?i)\bCPEUM\b|constituci[oó]n pol[ií]tica de los estados unidos mexicanos", question):
+        abreviatura = "CPEUM"
+    elif re.search(r"(?i)\bconstituci[oó]n\b|\bconstitucional\b", question):
+        abreviatura = "CPEUM"
+    elif re.search(r"(?i)\bLey de Amparo\b", question):
+        abreviatura = "LA"
+    elif re.search(r"(?i)\bLFPCA\b|ley federal de procedimiento contencioso administrativo", question):
+        abreviatura = "LFPCA"
+
     return {
         "articulo": articulo,
         "apartado": apartado,
         "fraccion": fraccion,
         "inciso": inciso,
+        "abreviatura": abreviatura,
     }
 
 
@@ -372,6 +388,218 @@ def _extract_apartado_from_meta(meta: dict) -> str | None:
         return m.group(1).upper()
 
     return None
+
+
+def _get_chunk_abreviatura(chunk: RetrievedChunk) -> str:
+    meta = chunk.chunk_meta or {}
+    ids = chunk.identifiers or {}
+    return str(
+        ids.get("abreviatura")
+        or meta.get("abreviatura")
+        or ""
+    ).upper().strip()
+
+
+def _get_chunk_articulo(chunk: RetrievedChunk) -> str:
+    meta = chunk.chunk_meta or {}
+    ids = chunk.identifiers or {}
+    return str(
+        ids.get("articulo")
+        or meta.get("articulo")
+        or ""
+    ).strip()
+
+
+def _question_mentions_explicit_norm(question: str) -> Optional[str]:
+    if re.search(r"(?i)\bcff\b|c[oó]digo fiscal de la federaci[oó]n|codigo fiscal de la federacion", question):
+        return "CFF"
+    if re.search(r"(?i)\bcpeum\b|constituci[oó]n pol[ií]tica de los estados unidos mexicanos", question):
+        return "CPEUM"
+    if re.search(r"(?i)\bconstituci[oó]n\b|\bconstitucional\b", question):
+        return "CPEUM"
+    if re.search(r"(?i)\bley de amparo\b", question):
+        return "LA"
+    if re.search(r"(?i)\blfpca\b|ley federal de procedimiento contencioso administrativo", question):
+        return "LFPCA"
+    return None
+
+
+def _score_norm_by_question_context(question: str) -> dict[str, float]:
+    q = question.lower()
+
+    scores = {
+        "CPEUM": 0.0,
+        "CFF": 0.0,
+        "LA": 0.0,
+        "LFPCA": 0.0,
+    }
+
+    constitutional_terms = [
+        "garantía", "garantias", "garantías",
+        "derecho", "derechos",
+        "persona", "personas",
+        "protege", "proteger", "protección", "proteccion",
+        "constitución", "constitucion", "constitucional",
+        "proceso penal", "imputado", "víctima", "victima",
+        "libertad", "aprehensión", "aprehension",
+        "autoridad judicial", "mandamiento", "datos personales",
+    ]
+
+    fiscal_terms = [
+        "contribución", "contribuciones",
+        "fiscal", "fiscales",
+        "sat", "tesorería", "tesoreria",
+        "recargos", "multas",
+        "pago", "pagar", "pagos",
+        "acreditamiento", "tipo de cambio",
+        "inpc", "índice nacional de precios al consumidor", "indice nacional de precios al consumidor",
+        "comercio exterior",
+    ]
+
+    amparo_terms = [
+        "amparo", "quejoso", "quejosa", "autoridad responsable",
+        "acto reclamado", "suspensión", "suspension",
+        "conceptos de violación", "conceptos de violacion",
+    ]
+
+    lfpca_terms = [
+        "nulidad", "juicio contencioso", "contencioso administrativo",
+        "sala regional", "tfja", "tribunal federal de justicia administrativa",
+        "demanda de nulidad",
+    ]
+
+    for term in constitutional_terms:
+        if term in q:
+            scores["CPEUM"] += 1.0
+
+    for term in fiscal_terms:
+        if term in q:
+            scores["CFF"] += 1.0
+
+    for term in amparo_terms:
+        if term in q:
+            scores["LA"] += 1.0
+
+    for term in lfpca_terms:
+        if term in q:
+            scores["LFPCA"] += 1.0
+
+    if "cómo protege" in q or "como protege" in q:
+        scores["CPEUM"] += 2.0
+
+    if "cómo se paga" in q or "como se paga" in q:
+        scores["CFF"] += 2.0
+
+    return scores
+
+
+def _detect_normative_ambiguity(
+    question: str,
+    chunks: list[RetrievedChunk],
+) -> dict[str, Any]:
+    ref = _parse_structured_ref(question)
+    explicit_norm = _question_mentions_explicit_norm(question)
+
+    if not ref["articulo"]:
+        return {
+            "is_ambiguous": False,
+            "resolved_norm": explicit_norm,
+            "candidate_norms": [],
+            "reason": "no_article_ref",
+        }
+
+    candidate_norms: list[str] = []
+    for c in chunks:
+        articulo = _get_chunk_articulo(c)
+        abreviatura = _get_chunk_abreviatura(c)
+
+        if articulo == ref["articulo"] and abreviatura:
+            candidate_norms.append(abreviatura)
+
+    candidate_norms = sorted(set(candidate_norms))
+
+    if explicit_norm:
+        return {
+            "is_ambiguous": False,
+            "resolved_norm": explicit_norm,
+            "candidate_norms": candidate_norms,
+            "reason": "explicit_norm_in_question",
+        }
+
+    if len(candidate_norms) <= 1:
+        return {
+            "is_ambiguous": False,
+            "resolved_norm": candidate_norms[0] if candidate_norms else None,
+            "candidate_norms": candidate_norms,
+            "reason": "single_candidate_norm",
+        }
+
+    scores = _score_norm_by_question_context(question)
+    ranked = sorted(
+        [(norm, scores.get(norm, 0.0)) for norm in candidate_norms],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    top_norm, top_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else -1.0
+
+    if top_score >= 1.5 and (top_score - second_score) >= 1.0:
+        return {
+            "is_ambiguous": False,
+            "resolved_norm": top_norm,
+            "candidate_norms": candidate_norms,
+            "reason": "resolved_by_context",
+            "context_scores": scores,
+        }
+
+    return {
+        "is_ambiguous": True,
+        "resolved_norm": None,
+        "candidate_norms": candidate_norms,
+        "reason": "multiple_homonym_articles_without_clear_context",
+        "context_scores": scores,
+    }
+
+
+def _filter_chunks_to_norm(
+    chunks: list[RetrievedChunk],
+    abreviatura: str,
+) -> list[RetrievedChunk]:
+    abreviatura = (abreviatura or "").upper().strip()
+    if not abreviatura:
+        return chunks
+
+    filtered = []
+    for c in chunks:
+        if _get_chunk_abreviatura(c) == abreviatura:
+            filtered.append(c)
+    return filtered
+
+
+def _build_ambiguity_answer(question: str, ambiguity: dict[str, Any]) -> str:
+    article_ref = _parse_structured_ref(question).get("articulo")
+    norms = ambiguity.get("candidate_norms", []) or []
+
+    norm_names = {
+        "CPEUM": "Constitución Política de los Estados Unidos Mexicanos",
+        "CFF": "Código Fiscal de la Federación",
+        "LA": "Ley de Amparo",
+        "LFPCA": "Ley Federal de Procedimiento Contencioso Administrativo",
+    }
+
+    rendered = []
+    for n in norms:
+        rendered.append(norm_names.get(n, n))
+
+    norms_text = "; ".join(rendered) if rendered else "más de una norma"
+
+    return (
+        f"La consulta es ambigua porque el artículo {article_ref} aparece en más de una norma del corpus.\n\n"
+        f"Normas candidatas detectadas: {norms_text}.\n\n"
+        "Precise la norma aplicable para responder con seguridad. "
+        'Por ejemplo: "artículo 20 del CFF" o "artículo 20 de la Constitución".'
+    )
 
 
 def _extract_fraccion_from_meta(meta: dict) -> str | None:
@@ -419,8 +647,16 @@ def _has_exact_structural_match(question: str, chunks: list[RetrievedChunk]) -> 
         apartado = _extract_apartado_from_meta(meta)
         fraccion = _extract_fraccion_from_meta(meta)
         inciso = _extract_inciso_from_meta(meta)
+        abreviatura = (
+            ids.get("abreviatura")
+            or meta.get("abreviatura")
+            or ""
+        )
+        abreviatura = str(abreviatura).upper()
 
         if articulo != ref["articulo"]:
+            continue
+        if ref["abreviatura"] and abreviatura != ref["abreviatura"]:
             continue
         if ref["apartado"] and apartado != ref["apartado"]:
             continue
@@ -452,8 +688,16 @@ def _filter_to_exact_subtree(
         apartado = _extract_apartado_from_meta(meta)
         fraccion = _extract_fraccion_from_meta(meta)
         inciso = _extract_inciso_from_meta(meta)
+        abreviatura = (
+            ids.get("abreviatura")
+            or meta.get("abreviatura")
+            or ""
+        )
+        abreviatura = str(abreviatura).upper()
 
         if articulo != ref["articulo"]:
+            continue
+        if ref["abreviatura"] and abreviatura != ref["abreviatura"]:
             continue
         if ref["apartado"] and apartado != ref["apartado"]:
             continue
@@ -481,40 +725,113 @@ def _sort_chunks_by_source_order(chunks: list[RetrievedChunk]) -> list[Retrieved
 def ask_rag(question: str, top_k: int = 8) -> Dict[str, Any]:
     initial_k = max(top_k * 3, 20)
 
-    chunks = search_hybrid(question, top_k=initial_k)
-    chunks = legal_rerank(question, chunks, top_k=max(top_k * 3, 12))
+    # ── 1. Retrieval inicial ──────────────────────────────────────────────────
+    # all_chunks conserva los initial_k completos para:
+    #   a) detección de ambigüedad con mayor visibilidad de normas
+    #   b) expansión de artículo completo sin segundo search_hybrid
+    all_chunks = search_hybrid(question, top_k=initial_k)
+    chunks = legal_rerank(question, all_chunks, top_k=top_k)
 
+    # ── 2. Desambiguación normativa sobre all_chunks (no solo top_k) ──────────
+    # Usar all_chunks evita que el rerank oculte normas candidatas relevantes
+    ambiguity = _detect_normative_ambiguity(question, all_chunks)
+
+    if ambiguity["is_ambiguous"]:
+        coverage = _compute_coverage(question, chunks)
+        used_chunk_ids = [c.chunk_id for c in chunks[:top_k]]
+
+        logger.warning(
+            "Ambigüedad normativa detectada. question=%s article=%s candidates=%s",
+            question,
+            _parse_structured_ref(question).get("articulo"),
+            ambiguity.get("candidate_norms"),
+        )
+
+        return {
+            "question": question,
+            "answer": _build_ambiguity_answer(question, ambiguity),
+            "citations": [],
+            "chunks": [c.__dict__ for c in chunks[:top_k]],
+            "diagnostics": {
+                **coverage,
+                "ambiguity": ambiguity,
+            },
+            "abstained": True,
+            "confidence": {
+                "top_score": chunks[0].score if chunks else 0.0,
+                "top_fts": chunks[0].fts_rank if chunks else 0.0,
+                "coverage_ratio": coverage.get("coverage_ratio", 0.0),
+                "core_coverage_ratio": coverage.get("core_coverage_ratio", 0.0),
+            },
+            "question_type": _classify_question_type(question),
+            "used_chunk_ids": used_chunk_ids,
+        }
+
+    # ── 3. Filtrar a la norma resuelta por contexto ───────────────────────────
+    resolved_norm = ambiguity.get("resolved_norm")
+    if resolved_norm:
+        filtered = _filter_chunks_to_norm(chunks, resolved_norm)
+        if filtered:
+            chunks = filtered
+
+    # ── 4. Exactitud estructural ──────────────────────────────────────────────
     exact_match = _has_exact_structural_match(question, chunks)
 
     if exact_match:
-        chunks = _filter_to_exact_subtree(question, chunks, top_k=max(top_k * 3, 12))
+        chunks = _filter_to_exact_subtree(question, chunks, top_k=top_k)
         chunks = _sort_chunks_by_source_order(chunks)
 
+    # ── 5. Expansión para artículo completo ───────────────────────────────────
+    # MODIFICACIÓN: ya no hace un segundo search_hybrid.
+    # Filtra directamente desde all_chunks (ya recuperados en paso 1).
     if _looks_like_full_article_request(question) and not exact_match and chunks:
-        top_doc_id = chunks[0].document_id
-        expanded_chunks = search_hybrid(question, top_k=top_k * 6)
-        sibling_chunks = [c for c in expanded_chunks if c.document_id == top_doc_id]
+        ref = _parse_structured_ref(question)
+        desired_norm = ref.get("abreviatura") or resolved_norm
+
+        sibling_chunks = []
+        for c in all_chunks:
+            ids = c.identifiers or {}
+            meta = c.chunk_meta or {}
+
+            articulo = ids.get("articulo") or meta.get("articulo")
+            abreviatura = str(
+                ids.get("abreviatura") or meta.get("abreviatura") or ""
+            ).upper()
+
+            if ref["articulo"] and articulo != ref["articulo"]:
+                continue
+            if desired_norm and abreviatura != desired_norm:
+                continue
+
+            sibling_chunks.append(c)
+
         if sibling_chunks:
             chunks = legal_rerank(question, sibling_chunks, top_k=max(top_k * 3, 12))
 
+    # ── 6. Lista final ────────────────────────────────────────────────────────
     final_chunks = chunks[:top_k]
-
     coverage = _compute_coverage(question, final_chunks)
     citations = build_citations(final_chunks)
     used_chunk_ids = [c.chunk_id for c in final_chunks]
+
     exact_match = _has_exact_structural_match(question, final_chunks)
 
+    # ── 7. Guardrails ─────────────────────────────────────────────────────────
     if _should_abstain(question, final_chunks, coverage) and not exact_match:
         logger.warning(
-            f"Guardrail activado para pregunta: {question}. "
-            f"Coverage: {coverage['core_coverage_ratio']}"
+            "Guardrail activado para pregunta: %s. Coverage: %s",
+            question,
+            coverage.get("core_coverage_ratio"),
         )
         return {
             "question": question,
             "answer": _build_abstention_answer(question, final_chunks, coverage),
             "citations": [],
             "chunks": [c.__dict__ for c in final_chunks],
-            "diagnostics": coverage,
+            "diagnostics": {
+                **coverage,
+                "ambiguity": ambiguity,
+            },
             "abstained": True,
             "confidence": {
                 "top_score": final_chunks[0].score if final_chunks else 0.0,
@@ -526,17 +843,10 @@ def ask_rag(question: str, top_k: int = 8) -> Dict[str, Any]:
             "used_chunk_ids": used_chunk_ids,
         }
 
+    # ── 8. Evidencia para LLM ─────────────────────────────────────────────────
     evidence = "\n\n".join(
         [
-            (
-                f"UBICACION_JURIDICA: "
-                f"articulo={c.identifiers.get('articulo', c.chunk_meta.get('articulo', 'N/D'))}; "
-                f"apartado={_extract_apartado_from_meta(c.chunk_meta) or 'N/D'}; "
-                f"fraccion={_extract_fraccion_from_meta(c.chunk_meta) or 'N/D'}; "
-                f"inciso={_extract_inciso_from_meta(c.chunk_meta) or 'N/D'}; "
-                f"path={c.chunk_meta.get('path', 'N/D')}\n"
-                f"TEXTO:\n{c.chunk_text}"
-            )
+            f"[chunk_id={c.chunk_id} | expediente={c.identifiers.get('expediente', 'N/D')} | registro={c.identifiers.get('registro_digital', 'N/D')}]\n{c.chunk_text}"
             for c in final_chunks
         ]
     )
@@ -551,12 +861,8 @@ def ask_rag(question: str, top_k: int = 8) -> Dict[str, Any]:
                     f"Pregunta:\n{question}\n\n"
                     f"Evidencia:\n{evidence}\n\n"
                     "Instrucción: Responde SOLO con base en la evidencia. "
-                    "Primero identifica internamente la ubicación jurídica correcta de los fragmentos usando articulo/apartado/fraccion/inciso/path. "
-                    "No confundas remisiones internas del texto con la ubicación del fragmento. "
-                    "No muestres esa validación interna en la respuesta final. "
-                    "Entrega una respuesta limpia para usuario final, sin metadata técnica ni trazas. "
-                    "Si la pregunta pide el contenido de una disposición, empieza directamente con lo que prevé esa disposición. "
-
+                    "Si la evidencia no define expresamente lo preguntado, dilo con claridad. "
+                    "Si la consulta se refiere a una sola norma, no mezcles artículos homónimos de otras normas."
                 ),
             },
         ],
@@ -567,7 +873,10 @@ def ask_rag(question: str, top_k: int = 8) -> Dict[str, Any]:
         "answer": resp.choices[0].message.content,
         "citations": citations,
         "chunks": [c.__dict__ for c in final_chunks],
-        "diagnostics": coverage,
+        "diagnostics": {
+            **coverage,
+            "ambiguity": ambiguity,
+        },
         "abstained": False,
         "confidence": {
             "top_score": final_chunks[0].score if final_chunks else 0.0,
