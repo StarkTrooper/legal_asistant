@@ -176,7 +176,7 @@ more robust citation formatting
 support for additional legal corpora
 deployment hardening
 public demo environment
-
+```
 ---
 ##  Author
 ## Gaddiel Ramos
